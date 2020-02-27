@@ -1,12 +1,16 @@
 package gosvm
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
 // KernelCache ...
 type KernelCache struct {
 	diff   map[int]map[int]float64
 	same   map[int]float64
 	mapper func(int) int
+	mut    *sync.Mutex
 }
 
 // NewKernelCache ...
@@ -14,6 +18,7 @@ func NewKernelCache() *KernelCache {
 	return &KernelCache{
 		diff: make(map[int]map[int]float64),
 		same: make(map[int]float64),
+		mut:  &sync.Mutex{},
 		mapper: func(a int) int {
 			return a
 		},
@@ -22,6 +27,8 @@ func NewKernelCache() *KernelCache {
 
 // Add ...
 func (kc *KernelCache) Add(i, j int, value float64) {
+	kc.mut.Lock()
+	defer kc.mut.Unlock()
 	i, j = kc.mapper(i), kc.mapper(j)
 	if i == j {
 		kc.same[i] = value
@@ -36,11 +43,12 @@ func (kc *KernelCache) Add(i, j int, value float64) {
 	}
 	inner[j] = value
 	kc.diff[i] = inner
-
 }
 
 // Get ...
 func (kc *KernelCache) Get(i, j int) (float64, error) {
+	kc.mut.Lock()
+	defer kc.mut.Unlock()
 	i, j = kc.mapper(i), kc.mapper(j)
 	if i == j {
 		v, ok := kc.same[i]
@@ -64,8 +72,8 @@ func (kc *KernelCache) Get(i, j int) (float64, error) {
 
 }
 
-// SliceCopy ...
-func (kc *KernelCache) SliceCopy(idx []int) *KernelCache {
+// Slice ...
+func (kc *KernelCache) Slice(idx []int) *KernelCache {
 	mapper := func(a int) int {
 		a = kc.mapper(a)
 		return idx[a]
@@ -74,5 +82,6 @@ func (kc *KernelCache) SliceCopy(idx []int) *KernelCache {
 		same:   kc.same,
 		diff:   kc.diff,
 		mapper: mapper,
+		mut:    kc.mut,
 	}
 }

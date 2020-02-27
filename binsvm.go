@@ -8,27 +8,32 @@ import (
 
 // BinarySVM ...
 type BinarySVM struct {
-	C       float64
-	Tol     float64
-	MaxIter int
-	W       *mat.VecDense
-	Alpha   *mat.VecDense
-	B       float64
-	errs    *mat.VecDense
-	n       int
-	m       int
-	data    mat.Dense
-	target  []float64
-	cache   *KernelCache
+	C          float64
+	Tol        float64
+	MaxIter    int
+	W          *mat.VecDense
+	Alpha      *mat.VecDense
+	B          float64
+	errs       []float64
+	n          int
+	m          int
+	data       mat.Dense
+	target     []float64
+	cache      *KernelCache
+	kernelFunc KernelFunc
 }
 
 // NewBinarySVM ...
-func NewBinarySVM(c, tol float64, maxIter int) *BinarySVM {
+func NewBinarySVM(c, tol float64, maxIter int, kernelFunc KernelFunc, cache *KernelCache) *BinarySVM {
+	if cache == nil {
+		cache = NewKernelCache()
+	}
 	return &BinarySVM{
-		C:       c,
-		Tol:     tol,
-		MaxIter: maxIter,
-		cache:   NewKernelCache(),
+		C:          c,
+		Tol:        tol,
+		MaxIter:    maxIter,
+		cache:      cache,
+		kernelFunc: kernelFunc,
 	}
 }
 
@@ -40,14 +45,14 @@ func makeFloatArray(n int, value float64) []float64 {
 	return res
 }
 
-func nRange(from, to int) chan int {
+func nRange(from, to int) <-chan int {
 	ch := make(chan int)
 	go func() {
 		for i := from; i < to; i++ {
 			ch <- i
 		}
+		close(ch)
 	}()
-	close(ch)
 	return ch
 }
 
@@ -56,18 +61,110 @@ func (bin *BinarySVM) SVMOut(x mat.Vector) float64 {
 	return mat.Dot(bin.W, x) - bin.B
 }
 
+func (bin *BinarySVM) getKernel(i1, i2 int) float64 {
+	res, err := bin.cache.Get(i1, i1)
+	if err != nil {
+		res = bin.kernelFunc(bin.data.RowView(i1), bin.data.RowView(i2))
+		bin.cache.Add(i1, i2, res)
+	}
+	return res
+}
+
 func (bin *BinarySVM) takeStep(i1, i2 int) bool {
 	if i1 == i2 {
 		return false
 	}
+	a1 := bin.Alpha.AtVec(i1)
+	a2 := bin.Alpha.AtVec(i2)
+	y1 := bin.target[i1]
+	y2 := bin.target[i2]
+	E1 := bin.errs[i1]
+	E2 := bin.errs[i2]
+	s := y1 * y2
 
-	return false
+	var L, H float64
+	if y1 != y2 {
+		L = math.Max(0, a2-a1)
+		H = math.Min(bin.C, bin.C+a2-a1)
+	} else {
+		L = math.Max(0, a1+a2-bin.C)
+		H = math.Min(bin.C, a1+a2)
+	}
+
+	if L == H {
+		return false
+	}
+
+	k11 := bin.getKernel(i1, i1)
+	k12 := bin.getKernel(i1, i2)
+	k22 := bin.getKernel(i2, i2)
+	eta := k11 + k22 - 2*k12
+
+	var a1New, a2New float64
+
+	if eta > 0 {
+		a2New = a2 + y2*(E1-E2)/eta
+		if a2New <= L {
+			a2New = L
+		} else if a2New >= H {
+			a2New = H
+		}
+	} else {
+		f1 := y1*(E1+bin.B) - a1*k11 - s*a2*k22
+		f2 := y2*(E2+bin.B) - s*a1*k11 - a2*k22
+		L1 := a1 + s*(a2-L)
+		H1 := a1 + s*(a2-H)
+		LObj := L1*f1 + L*f2 + (L1 * L1 * k11 / 2) + (L * L * k22) + s*L*L1*k12
+		HObj := H1*f1 + H*f2 + (H1 * H1 * k11 / 2) + (H * H * k22 / 2) + s*H*H1*k12
+		if LObj < HObj-0.001 {
+			a2New = L
+		} else if LObj > HObj+0.001 {
+			a2New = H
+		} else {
+			a2New = a2
+		}
+	}
+	if math.Abs(a2New-a2) < 0.001*(a2New+a2+0.001) {
+		return false
+	}
+	a1New = a1 + s*(a2-a2New)
+	b1 := E1 + y1*(a1New-a1)*k11 + y2*(a2New-a2)*k12 + bin.B
+	b2 := E2 + y1*(a1New-a1)*k11 + y2*(a2New-a2)*k12 + bin.B
+
+	var bNew float64
+	if 0 < a1New && a1New < bin.C {
+		bNew = b1
+	} else if 0 < a2New && a2New < bin.C {
+		bNew = b2
+	} else {
+		bNew = (b1 + b2) / 2
+	}
+
+	bin.Alpha.SetVec(i1, a1New)
+	bin.Alpha.SetVec(i2, a2New)
+	bin.B = bNew
+
+	var temp mat.VecDense
+	add1 := y1 * (a1New - a1)
+	add2 := y2 * (a2New - a2)
+
+	var dt1, dt2 mat.VecDense
+	dt1.MulElemVec(&dt1, mat.NewVecDense(bin.m, makeFloatArray(bin.m, add1)))
+	dt2.MulElemVec(&dt2, mat.NewVecDense(bin.m, makeFloatArray(bin.m, add2)))
+	temp.AddVec(bin.W, &dt1)
+	temp.AddVec(&temp, &dt2)
+	bin.W = &temp
+
+	for i := 0; i < bin.n; i++ {
+		bin.errs[i] = bin.SVMOut(bin.data.RowView(i)) - bin.target[i]
+	}
+	return true
 }
 
 func (bin *BinarySVM) examineExample(i2 int) int {
 	y2 := bin.target[i2]
 	a2 := bin.Alpha.AtVec(i2)
-	err2 := bin.errs.AtVec(i2)
+	err2 := bin.errs[i2]
 	r2 := y2 * a2
 
 	if (r2 < bin.Tol && a2 < bin.C) || (r2 > bin.Tol && a2 > 0) {
@@ -88,12 +185,12 @@ func (bin *BinarySVM) examineExample(i2 int) int {
 			} else {
 				zeroCList = append(zeroCList, i)
 			}
-			if bin.errs.AtVec(i) > maxErr {
-				maxErr = bin.errs.AtVec(i)
+			if bin.errs[i] > maxErr {
+				maxErr = bin.errs[i]
 				maxIndex = i
 			}
-			if bin.errs.AtVec(i) < minErr {
-				minErr = bin.errs.AtVec(i)
+			if bin.errs[i] < minErr {
+				minErr = bin.errs[i]
 				minIndex = i
 			}
 		}
@@ -137,8 +234,10 @@ func (bin *BinarySVM) Train(dataTrain mat.Dense, target []float64) {
 	bin.Alpha = mat.NewVecDense(bin.n, nil)
 	bin.target = target
 
-	temp := mat.NewVecDense(bin.n, target)
-	temp.SubVec(temp, mat.NewVecDense(bin.n, makeFloatArray(bin.n, 1)))
+	temp := make([]float64, len(target))
+	for i := 0; i < bin.n; i++ {
+		temp[i] = -target[i]
+	}
 	bin.errs = temp
 
 	examineAll := true
